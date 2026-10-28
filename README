@@ -1,0 +1,106 @@
+# Dataplane Router — Popescu Anelisse Maria 321CB
+
+## Cerința 1  — Procesul de dirijare IPv4
+
+M-am ghidat după scheletul de la lab 4, dar am ales să modularizez totul în funcții separate ca să-mi fie mai ușor să urmăresc codul și să fac debug.
+
+**Cum am structurat logica:**
+
+- `aloca_si_citeste_tabele()` — alocă tabelele de rutare și ARP și citește datele din fișierele de input
+- `construieste_trie_rutare()` / `adauga_in_trie()` / `cauta_in_trie()` — LPM eficient via trie (detalii la cerința 2)
+- `este_pachet_pentru_mine()` — parcurge toate interfețele routerului și compară IP-ul destinație cu IP-ul fiecărei interfețe
+- `pachet_valid_checksum_si_ttl()` — validare înainte de dirijare: checksum incorect → drop direct, TTL ≤ 1 → Time Exceeded + drop
+- `proceseaza_si_trimite()` — funcția principală de forwarding
+
+**O subtilitate cu endianness** pe care am prins-o mai greu: la validarea checksum-ului trebuia să fac `ntohs(old_checksum)` ca să compar corect suma calculată pe host (Little Endian) cu ce era în header (Big Endian). La fel și la recalcularea după decrementarea TTL — după ce calculez noua sumă, trebuie `htons()` înainte să o pun înapoi în header, altfel următorul router o vede ca coruptă.
+
+**Rescrierea adreselor L2:** am folosit `get_interface_mac` pentru MAC-ul sursă al interfeței de ieșire și `cauta_arp(best_route->next_hop)` pentru MAC-ul destinație.
+
+### Screenshot cerința 1 + 2 — `subiect1&2.png`
+
+Scenariu: `ping -c 4 192.168.1.101` de pe `h-0`. Routerul pornește cu tabela ARP statică (se vede în terminalul `router-0` secțiunea "Parsing ARP table" cu toate intrările încărcate din fișier).
+
+Captura Wireshark arată:
+- Frame 1: ARP Request inițial (`Who has 192.168.0.1? Tell 192.168.0.2`) — rezolvare normală la pornire
+- Frame 2: ARP Reply (`192.168.0.1 is at de:fe:c8:ed:00:00`)
+- Frames 3–10: pachete ICMP Echo Request cu TTL alternând între 64 și 63
+
+TTL-ul de 63 pe pachetele cu `(no response found!)` confirmă că routerul primește pachetul cu TTL=64, îl decrementează corect la 63 și îl retransmite mai departe. `(no response found!)` e normal la acest pas — enunțul nu cere ICMP, routerul doar face forwarding, nu generează răspuns.
+
+Terminalul din `h-0` arată `4 packets transmitted, 0 received, 100% packet loss` — corect, pentru că destinația `192.168.1.101` nu există în topologie, deci nu vine niciun Echo Reply înapoi. Dovada că dirijarea funcționează e tocmai faptul că pachetele ies pe interfață cu TTL decrementat, vizibil în Wireshark.
+
+---
+
+## Cerința 2 — LPM eficient (Trie)
+
+Am implementat un trie binar în care fiecare nod are doi copii (bit 0 și bit 1). La inserare, parcurg prefix-ul bit cu bit pe lungimea măștii și rețin ruta pe ultimul nod. La căutare, merg bit cu bit pe IP-ul destinație și rețin cel mai recent nod care are o rută — asta e definiția Longest Prefix Match.
+
+Inițial implementasem căutarea liniară (am lăsat și codul ăla comentat în sursă ca să se vadă că l-am încercat).
+---
+
+## Cerința 3 — Protocolul ARP
+
+Am șters `arp_table.txt` din arhivă ca să activez testele de ARP din checker și am implementat popularea dinamică a tabelei ARP.
+
+**Ce am implementat:**
+
+- `handle_arp()` — punct de intrare pentru pachetele ARP
+- `proceseaza_arp_request()` — când primesc un ARP Request pentru IP-ul meu, construiesc un Reply unicast cu MAC-ul interfeței și îl trimit înapoi
+- `trimite_arp_request()` — când routerul știe next hop-ul dar nu îi cunoaște MAC-ul, trimite un ARP Request broadcast pe interfața de ieșire
+- `proceseaza_arp_reply()` — salvez IP + MAC în cache, apoi eliberez toate pachetele care așteptau după acel IP
+- `adauga_in_arp_cache()` — inserție în poziția corectă în vectorul sortat, cu `realloc` dacă s-a depășit capacitatea
+
+**Alegere de implementare — ARP cache sortat + căutare binară:** în loc să folosesc un hashmap sau căutare liniară, am ținut tabela ARP sortată după IP și am folosit căutare binară atât la lookup (`cauta_arp`) cât și la inserție (`adauga_in_arp_cache`). La inserție fac shift pentru a menține ordinea.
+
+**Sistemul de cozi pentru pachetele în așteptare:** am implementat un hash table de cozi (`waiting_buckets[256]`) indexat după IP-ul next hop-ului. Fiecare bucket e o coadă de structuri `packet_in_asteptare` care rețin: buffer-ul brut al pachetului, lungimea, IP-ul next hop și interfața de ieșire. Dacă am deja pachete în coadă pentru un IP, nu mai trimit un nou ARP Request — evit astfel inundarea rețelei cu cereri identice.
+
+### Screenshot cerința 3 — `subiect3.png`
+
+Captura Wireshark arată schimbul ARP complet: Request broadcast (`Who has 192.0.1.1? Tell 192.0.1.2`) urmat de Reply unicast, după care routerul trimite pachetele IPv4 care erau în coadă. Terminalele confirmă că pachetele sunt dirijate corect după rezolvarea adreselor MAC.
+
+---
+
+## Cerința 4 — Protocolul ICMP
+
+Am implementat două funcții separate:
+
+- `trimite_icmp()` — pentru mesaje de eroare: **Time Exceeded** (Type 11, Code 0) la TTL expirat și **Destination Unreachable** (Type 3, Code 0) când nu găsesc rută. Payload-ul ICMP conține header-ul IPv4 original + primii 8 octeți din datele sale.
+- `trimite_icmp_echo_reply()` — pentru ping direct către router (Type 8 → Type 0). Inversez adresele sursă/destinație la nivel IP și MAC, copiez payload-ul exact (inclusiv Identifier și Sequence Number) și recalculez checksum-urile.
+
+**De ce două funcții separate:** cele două cazuri au logici diferite. Echo Reply lucrează pe pachetul original modificat in-place, pe când mesajele de eroare construiesc un pachet complet nou cu payload specific. Am preferat claritatea față de un singur `if` uriaș.
+
+### Screenshot Time Exceeded — `subiect4_1.png`
+
+Scenariu: `ping -c 3 -t 1 192.168.1.101` de pe `h-2` (flag `-t 1` forțează TTL=1).
+
+Fereastra Wireshark extinsă pe Frame 2 confirmă că routerul a generat corect mesajul ICMP Type 11, Code 0 și a încapsulat în payload header-ul IPv4 original + primii 8 octeți din Echo Request. Terminalul din `h-2` afișează `Time to live exceeded` pentru toate cele 3 pachete.
+
+### Screenshot Destination Unreachable — `subiect4_2.png`
+
+Scenariu: `ping -c 5 8.8.8.8` de pe `h-0` (IP inexistent în tabela de rutare).
+
+Trie-ul returnează NULL la căutare. Wireshark — Frame 10 extins — arată Type 3, Code 0 (Network unreachable), checksum corect, cu header-ul IPv4 original (`Src: 192.168.0.2, Dst: 8.8.8.8`) încapsulat corect. Terminalul din `h-0` primește `Destination Net Unreachable` pentru fiecare pachet.
+
+### Screenshot Echo Reply — `subiect4_3.png`
+
+Scenariu: `ping -c 3 192.168.0.1` de pe `h-0` (IP-ul interfeței routerului).
+
+Wireshark arată perechile Request/Reply cu `id=0x544b`. Routerul a returnat exact același `id` și `seq` — ceea ce confirmă că payload-ul a fost copiat corect. Terminalul din `h-0` afișează 0% packet loss.
+
+---
+
+## Fluxul programului
+
+1. Init, construire trie, inițializare hash table cozi ARP
+2. Loop `while(1)`: primesc pachet pe orice interfață
+3. Verific `ethr_type`:
+   - `0x0806` (ARP) → `handle_arp()` + `continue`
+   - `0x0800` (IPv4) → continui
+4. `este_pachet_pentru_mine()` → dacă da și e ICMP Echo Request → `trimite_icmp_echo_reply()` + `continue`
+5. `pachet_valid_checksum_si_ttl()` → checksum greșit: drop; TTL ≤ 1: Time Exceeded + drop
+6. `proceseaza_si_trimite()`:
+   - rută negăsită → Destination Unreachable + drop
+   - rută găsită → decrementez TTL, recalculez checksum
+   - `cauta_arp(next_hop)`:
+     - MAC necunoscut → bag pachetul în coada pentru acel IP, trimit ARP Request dacă coada era goală
+     - MAC cunoscut → rescriu adresele Ethernet și `send_to_link()`
